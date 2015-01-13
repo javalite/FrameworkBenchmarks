@@ -1,18 +1,35 @@
 from setup.linux.installer import Installer
+from setup.linux import setup_util
+
 from benchmark import framework_test
+from benchmark.test_types import *
+from utils import header
+from utils import gather_tests
+from utils import gather_frameworks
 
 import os
 import json
 import subprocess
+import traceback
 import time
-import textwrap
 import pprint
 import csv
 import sys
 import logging
 import socket
+import threading
+import textwrap
+from pprint import pprint
+
 from multiprocessing import Process
+
 from datetime import datetime
+
+# Cross-platform colored text
+from colorama import Fore, Back, Style
+
+# Text-based progress indicators
+import progressbar
 
 class Benchmarker:
 
@@ -101,11 +118,7 @@ class Benchmarker:
     ##########################
     # Setup client/server
     ##########################
-    print textwrap.dedent("""
-      =====================================================
-        Preparing Server, Database, and Client ...
-      =====================================================
-      """)
+    print header("Preparing Server, Database, and Client ...", top='=', bottom='=')
     self.__setup_server()
     self.__setup_database()
     self.__setup_client()
@@ -117,25 +130,18 @@ class Benchmarker:
     ##########################
     # Run tests
     ##########################
-    print textwrap.dedent("""
-      =====================================================
-        Running Tests ...
-      =====================================================
-      """)
-    self.__run_tests(all_tests)
+    print header("Running Tests...", top='=', bottom='=')
+    result = self.__run_tests(all_tests)
 
     ##########################
     # Parse results
     ##########################  
     if self.mode == "benchmark":
-      print textwrap.dedent("""
-      =====================================================
-        Parsing Results ...
-      =====================================================
-      """)
+      print header("Parsing Results ...", top='=', bottom='=')
       self.__parse_results(all_tests)
 
     self.__finish()
+    return result
 
   ############################################################
   # End run
@@ -184,12 +190,23 @@ class Benchmarker:
   ############################################################
 
   ############################################################
+  # get_output_file(test_name, test_type)
+  # returns the output file name for this test_name and 
+  # test_type timestamp/test_type/test_name/raw 
+  ############################################################
+  def get_output_file(self, test_name, test_type):
+    return os.path.join(self.result_directory, self.timestamp, test_type, test_name, "raw")
+  ############################################################
+  # End get_output_file
+  ############################################################
+
+  ############################################################
   # output_file(test_name, test_type)
   # returns the output file for this test_name and test_type
   # timestamp/test_type/test_name/raw 
   ############################################################
   def output_file(self, test_name, test_type):
-    path = os.path.join(self.result_directory, self.timestamp, test_type, test_name, "raw")
+    path = self.get_output_file(test_name, test_type)
     try:
       os.makedirs(os.path.dirname(path))
     except OSError:
@@ -198,6 +215,36 @@ class Benchmarker:
   ############################################################
   # End output_file
   ############################################################
+
+
+  ############################################################
+  # get_stats_file(test_name, test_type)
+  # returns the stats file name for this test_name and 
+  # test_type timestamp/test_type/test_name/raw 
+  ############################################################
+  def get_stats_file(self, test_name, test_type):
+    return os.path.join(self.result_directory, self.timestamp, test_type, test_name, "stats")
+  ############################################################
+  # End get_stats_file
+  ############################################################
+
+
+  ############################################################
+  # stats_file(test_name, test_type)
+  # returns the stats file for this test_name and test_type
+  # timestamp/test_type/test_name/raw 
+  ############################################################
+  def stats_file(self, test_name, test_type):
+      path = self.get_stats_file(test_name, test_type)
+      try:
+        os.makedirs(os.path.dirname(path))
+      except OSError:
+        pass
+      return path
+  ############################################################
+  # End stats_file
+  ############################################################
+  
 
   ############################################################
   # full_results_directory
@@ -210,7 +257,7 @@ class Benchmarker:
       pass
     return path
   ############################################################
-  # End output_file
+  # End full_results_directory
   ############################################################
 
   ############################################################
@@ -226,13 +273,39 @@ class Benchmarker:
     return path
 
   ############################################################
-  # report_results
+  # report_verify_results
+  # Used by FrameworkTest to add verification details to our results
+  #
+  # TODO: Technically this is an IPC violation - we are accessing
+  # the parent process' memory from the child process
   ############################################################
-  def report_results(self, framework, test, results):
+  def report_verify_results(self, framework, test, result):
+    if framework.name not in self.results['verify'].keys():
+      self.results['verify'][framework.name] = dict()
+    self.results['verify'][framework.name][test] = result
+
+  ############################################################
+  # report_benchmark_results
+  # Used by FrameworkTest to add benchmark data to this
+  #
+  # TODO: Technically this is an IPC violation - we are accessing
+  # the parent process' memory from the child process
+  ############################################################
+  def report_benchmark_results(self, framework, test, results):
     if test not in self.results['rawData'].keys():
       self.results['rawData'][test] = dict()
 
-    self.results['rawData'][test][framework.name] = results
+    # If results has a size from the parse, then it succeeded.
+    if results:
+      self.results['rawData'][test][framework.name] = results
+
+      # This may already be set for single-tests
+      if framework.name not in self.results['succeeded'][test]:
+        self.results['succeeded'][test].append(framework.name)
+    else:
+      # This may already be set for single-tests
+      if framework.name not in self.results['failed'][test]:
+        self.results['failed'][test].append(framework.name)
 
   ############################################################
   # End report_results
@@ -247,95 +320,22 @@ class Benchmarker:
   ############################################################
   @property
   def __gather_tests(self):
-    tests = []
-    # Loop through each directory (we assume we're being run from the benchmarking root)
-    # and look for the files that signify a benchmark test
-    for dirname, dirnames, filenames in os.walk('.'):
-      # Look for the benchmark_config file, this will set up our tests.
-      # Its format looks like this:
-      #
-      # {
-      #   "framework": "nodejs",
-      #   "tests": [{
-      #     "default": {
-      #       "setup_file": "setup",
-      #       "json_url": "/json"
-      #     },
-      #     "mysql": {
-      #       "setup_file": "setup",
-      #       "db_url": "/mysql",
-      #       "query_url": "/mysql?queries="
-      #     },
-      #     ...
-      #   }]
-      # }
-      if 'benchmark_config' in filenames:
-        config = None
-        config_file_name = os.path.join(dirname, 'benchmark_config')
+    tests = gather_tests(include=self.test, 
+      exclude=self.exclude,
+      benchmarker=self)
 
-        with open(config_file_name, 'r') as config_file:
-          # Load json file into config object
-          try:
-            config = json.load(config_file)
-          except:
-            print("Error loading '%s'." % config_file_name)
-            raise
-
-        if config == None:
-          continue
-
-        test = framework_test.parse_config(config, dirname[2:], self)
-        # If the user specified which tests to run, then 
-        # we can skip over tests that are not in that list
-        if self.test == None:
-          tests = tests + test
-        else:
-          for atest in test:
-            if atest.name in self.test:
-              tests.append(atest)
-
-    tests.sort(key=lambda x: x.name)
+    # If the tests have been interrupted somehow, then we want to resume them where we left
+    # off, rather than starting from the beginning
+    if os.path.isfile('current_benchmark.txt'):
+        with open('current_benchmark.txt', 'r') as interrupted_benchmark:
+            interrupt_bench = interrupted_benchmark.read().strip()
+            for index, atest in enumerate(tests):
+                if atest.name == interrupt_bench:
+                    tests = tests[index:]
+                    break
     return tests
   ############################################################
   # End __gather_tests
-  ############################################################
-
-  ############################################################
-  # Gathers all the frameworks
-  ############################################################
-  def __gather_frameworks(self):
-    frameworks = []
-    # Loop through each directory (we assume we're being run from the benchmarking root)
-    for dirname, dirnames, filenames in os.walk('.'):
-      # Look for the benchmark_config file, this will contain our framework name
-      # It's format looks like this:
-      #
-      # {
-      #   "framework": "nodejs",
-      #   "tests": [{
-      #     "default": {
-      #       "setup_file": "setup",
-      #       "json_url": "/json"
-      #     },
-      #     "mysql": {
-      #       "setup_file": "setup",
-      #       "db_url": "/mysql",
-      #       "query_url": "/mysql?queries="
-      #     },
-      #     ...
-      #   }]
-      # }
-      if 'benchmark_config' in filenames:
-        config = None
-        with open(os.path.join(dirname, 'benchmark_config'), 'r') as config_file:
-          # Load json file into config object
-          config = json.load(config_file)
-        if config == None:
-          continue
-        frameworks.append(str(config['framework']))
-    return frameworks
-  ############################################################
-  # End __gather_frameworks
   ############################################################
 
   ############################################################
@@ -350,7 +350,7 @@ class Benchmarker:
     try:
       if os.name == 'nt':
         return True
-      subprocess.check_call(["sudo","bash","-c","cd /sys/devices/system/cpu; ls -d cpu*|while read x; do echo performance > $x/cpufreq/scaling_governor; done"])
+      subprocess.check_call(["sudo","bash","-c","cd /sys/devices/system/cpu; ls -d cpu[0-9]*|while read x; do echo performance > $x/cpufreq/scaling_governor; done"])
       subprocess.check_call("sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535".rsplit(" "))
       subprocess.check_call("sudo sysctl -w net.core.somaxconn=65535".rsplit(" "))
       subprocess.check_call("sudo -s ulimit -n 65535".rsplit(" "))
@@ -418,32 +418,57 @@ class Benchmarker:
   ############################################################
 
   def __run_tests(self, tests):
+    if len(tests) == 0:
+      return 0
+
     logging.debug("Start __run_tests.")
     logging.debug("__name__ = %s",__name__)
 
+    error_happened = False
     if self.os.lower() == 'windows':
       logging.debug("Executing __run_tests on Windows")
       for test in tests:
-        self.__run_test(test)
+        with open('current_benchmark.txt', 'w') as benchmark_resume_file:
+          benchmark_resume_file.write(test.name)
+        if self.__run_test(test) != 0:
+          error_happened = True
     else:
       logging.debug("Executing __run_tests on Linux")
+
+      # Setup a nice progressbar and ETA indicator
+      widgets = [self.mode, ': ',  progressbar.Percentage(), 
+                 ' ', progressbar.Bar(),
+                 ' Rough ', progressbar.ETA()]
+      pbar = progressbar.ProgressBar(widgets=widgets, maxval=len(tests)).start()
+      pbar_test = 0
+
       # These features do not work on Windows
       for test in tests:
+        pbar.update(pbar_test)
+        pbar_test = pbar_test + 1
         if __name__ == 'benchmark.benchmarker':
-          print textwrap.dedent("""
-            -----------------------------------------------------
-              Running Test: {name} ...
-            -----------------------------------------------------
-            """.format(name=test.name))
-          test_process = Process(target=self.__run_test, args=(test,))
+          print header("Running Test: %s" % test.name)
+          with open('current_benchmark.txt', 'w') as benchmark_resume_file:
+            benchmark_resume_file.write(test.name)
+          test_process = Process(target=self.__run_test, name="Test Runner (%s)" % test.name, args=(test,))
           test_process.start()
           test_process.join(self.run_test_timeout_seconds)
+          self.__load_results()  # Load intermediate result from child process
           if(test_process.is_alive()):
             logging.debug("Child process for {name} is still alive. Terminating.".format(name=test.name))
             self.__write_intermediate_results(test.name,"__run_test timeout (="+ str(self.run_test_timeout_seconds) + " seconds)")
             test_process.terminate()
+            test_process.join()
+          if test_process.exitcode != 0:
+            error_happened = True
+      pbar.finish()
+    if os.path.isfile('current_benchmark.txt'):
+      os.remove('current_benchmark.txt')
     logging.debug("End __run_tests.")
 
+    if error_happened:
+      return 1
+    return 0
   ############################################################
   # End __run_tests
   ############################################################
@@ -459,33 +484,31 @@ class Benchmarker:
   # are needed.
   ############################################################
   def __run_test(self, test):
+    
+    # Used to capture return values 
+    def exit_with_code(code):
+      if self.os.lower() == 'windows':
+        return code
+      else:
+        sys.exit(code)
+
+    logDir = os.path.join(self.latest_results_directory, 'logs', test.name)
+
     try:
-      os.makedirs(os.path.join(self.latest_results_directory, 'logs', "{name}".format(name=test.name)))
-    except:
+      os.makedirs(logDir)
+    except Exception:
       pass
-    with open(os.path.join(self.latest_results_directory, 'logs', "{name}".format(name=test.name), 'out.txt'), 'w') as out, \
-         open(os.path.join(self.latest_results_directory, 'logs', "{name}".format(name=test.name), 'err.txt'), 'w') as err:
-      if hasattr(test, 'skip'):
-        if test.skip.lower() == "true":
-          out.write("Test {name} benchmark_config specifies to skip this test. Skipping.\n".format(name=test.name))
-          return
+    with open(os.path.join(logDir, 'out.txt'), 'w') as out, \
+         open(os.path.join(logDir, 'err.txt'), 'w') as err:
 
       if test.os.lower() != self.os.lower() or test.database_os.lower() != self.database_os.lower():
-        # the operating system requirements of this test for the
-        # application server or the database server don't match
-        # our current environment
         out.write("OS or Database OS specified in benchmark_config does not match the current environment. Skipping.\n")
-        return 
+        return exit_with_code(0)
       
       # If the test is in the excludes list, we skip it
       if self.exclude != None and test.name in self.exclude:
         out.write("Test {name} has been added to the excludes list. Skipping.\n".format(name=test.name))
-        return
-      
-      # If the test does not contain an implementation of the current test-type, skip it
-      if self.type != 'all' and not test.contains_type(self.type):
-        out.write("Test type {type} does not contain an implementation of the current test-type. Skipping.\n".format(type=self.type))
-        return
+        return exit_with_code(0)
 
       out.write("test.os.lower() = {os}  test.database_os.lower() = {dbos}\n".format(os=test.os.lower(),dbos=test.database_os.lower()))
       out.write("self.results['frameworks'] != None: {val}\n".format(val=str(self.results['frameworks'] != None)))
@@ -493,70 +516,59 @@ class Benchmarker:
       out.write("self.results['completed']: {completed}\n".format(completed=str(self.results['completed'])))
       if self.results['frameworks'] != None and test.name in self.results['completed']:
         out.write('Framework {name} found in latest saved data. Skipping.\n'.format(name=str(test.name)))
-        return
-
+        return exit_with_code(1)
       out.flush()
 
-      out.write( textwrap.dedent("""
-      =====================================================
-        Beginning {name}
-      -----------------------------------------------------
-      """.format(name=test.name)) )
+      out.write(header("Beginning %s" % test.name, top='='))
       out.flush()
 
       ##########################
       # Start this test
       ##########################  
-      out.write( textwrap.dedent("""
-      -----------------------------------------------------
-        Starting {name}
-      -----------------------------------------------------
-      """.format(name=test.name)) )
+      out.write(header("Starting %s" % test.name))
       out.flush()
       try:
-        p = subprocess.Popen(self.database_ssh_string, stdin=subprocess.PIPE, stdout=out, stderr=err, shell=True)
-        p.communicate("""
-          sudo restart mysql
-          sudo restart mongodb
-		      sudo /etc/init.d/postgresql restart
-        """)
-        time.sleep(10)
+        if test.requires_database():
+          p = subprocess.Popen(self.database_ssh_string, stdin=subprocess.PIPE, stdout=out, stderr=err, shell=True)
+          p.communicate("""
+            sudo restart mysql
+            sudo restart mongod
+            sudo service redis-server restart
+            sudo service postgresql restart
+          """)
+          time.sleep(10)
 
         if self.__is_port_bound(test.port):
-          self.__write_intermediate_results(test.name, "port " + str(test.port) + " is not available before start")
-          err.write( textwrap.dedent("""
-            ---------------------------------------------------------
-              Error: Port {port} is not available before start {name}
-            ---------------------------------------------------------
-            """.format(name=test.name, port=str(test.port))) )
+          # This can happen sometimes - let's try again
+          self.__stop_test(out, err)
+          out.flush()
           err.flush()
-          return
+          time.sleep(15)
+          if self.__is_port_bound(test.port):
+            # We gave it our all
+            self.__write_intermediate_results(test.name, "port " + str(test.port) + " is not available before start")
+            err.write(header("Error: Port %s is not available, cannot start %s" % (test.port, test.name)))
+            err.flush()
+            print "Error: Unable to recover port, cannot start test"
+            return exit_with_code(1)
 
         result = test.start(out, err)
         if result != 0: 
-          test.stop(out, err)
+          self.__stop_test(out, err)
           time.sleep(5)
           err.write( "ERROR: Problem starting {name}\n".format(name=test.name) )
-          err.write( textwrap.dedent("""
-            -----------------------------------------------------
-              Stopped {name}
-            -----------------------------------------------------
-            """.format(name=test.name)) )
           err.flush()
           self.__write_intermediate_results(test.name,"<setup.py>#start() returned non-zero")
-          return
+          return exit_with_code(1)
         
+        logging.info("Sleeping %s seconds to ensure framework is ready" % self.sleep)
         time.sleep(self.sleep)
 
         ##########################
         # Verify URLs
         ##########################
-        out.write( textwrap.dedent("""
-        -----------------------------------------------------
-          Verifying URLs for {name}
-        -----------------------------------------------------
-        """.format(name=test.name)) )
-        test.verify_urls(out, err)
+        logging.info("Verifying framework URLs")
+        passed_verify = test.verify_urls(out, err)
         out.flush()
         err.flush()
 
@@ -564,11 +576,8 @@ class Benchmarker:
         # Benchmark this test
         ##########################
         if self.mode == "benchmark":
-          out.write( textwrap.dedent("""
-            -----------------------------------------------------
-              Benchmarking {name} ...
-            -----------------------------------------------------
-            """.format(name=test.name)) )
+          logging.info("Benchmarking")
+          out.write(header("Benchmarking %s" % test.name))
           out.flush()
           test.benchmark(out, err)
           out.flush()
@@ -577,32 +586,27 @@ class Benchmarker:
         ##########################
         # Stop this test
         ##########################
-        out.write( textwrap.dedent("""
-        -----------------------------------------------------
-          Stopping {name}
-        -----------------------------------------------------
-        """.format(name=test.name)) )
+        out.write(header("Stopping %s" % test.name))
         out.flush()
-        test.stop(out, err)
+        self.__stop_test(out, err)
         out.flush()
         err.flush()
-        time.sleep(5)
+        time.sleep(15)
 
         if self.__is_port_bound(test.port):
-          self.__write_intermediate_results(test.name, "port " + str(test.port) + " was not released by stop")
-          err.write( textwrap.dedent("""
-            -----------------------------------------------------
-              Error: Port {port} was not released by stop {name}
-            -----------------------------------------------------
-            """.format(name=test.name, port=str(test.port))) )
+          # This can happen sometimes - let's try again
+          self.__stop_test(out, err)
+          out.flush()
           err.flush()
-          return
+          time.sleep(15)
+          if self.__is_port_bound(test.port):
+            # We gave it our all
+            self.__write_intermediate_results(test.name, "port " + str(test.port) + " was not released by stop")
+            err.write(header("Error: Port %s was not released by stop %s" % (test.port, test.name)))
+            err.flush()
+            return exit_with_code(1)
 
-        out.write( textwrap.dedent("""
-        -----------------------------------------------------
-          Stopped {name}
-        -----------------------------------------------------
-        """.format(name=test.name)) )
+        out.write(header("Stopped %s" % test.name))
         out.flush()
         time.sleep(5)
 
@@ -610,50 +614,59 @@ class Benchmarker:
         # Save results thus far into toolset/benchmark/latest.json
         ##########################################################
 
-        out.write( textwrap.dedent("""
-        ----------------------------------------------------
-        Saving results through {name}
-        ----------------------------------------------------
-        """.format(name=test.name)) )
+        out.write(header("Saving results through %s" % test.name))
         out.flush()
         self.__write_intermediate_results(test.name,time.strftime("%Y%m%d%H%M%S", time.localtime()))
+
+        if self.mode == "verify" and not passed_verify:
+          print "Failed verify!"
+          return exit_with_code(1)
       except (OSError, IOError, subprocess.CalledProcessError) as e:
         self.__write_intermediate_results(test.name,"<setup.py> raised an exception")
-        err.write( textwrap.dedent("""
-        -----------------------------------------------------
-          Subprocess Error {name}
-        -----------------------------------------------------
-        {err}
-        """.format(name=test.name, err=e)) )
+        err.write(header("Subprocess Error %s" % test.name))
+        traceback.print_exc(file=err)
         err.flush()
         try:
-          test.stop(out, err)
+          self.__stop_test(out, err)
         except (subprocess.CalledProcessError) as e:
           self.__write_intermediate_results(test.name,"<setup.py>#stop() raised an error")
-          err.write( textwrap.dedent("""
-          -----------------------------------------------------
-            Subprocess Error: Test .stop() raised exception {name}
-          -----------------------------------------------------
-          {err}
-          """.format(name=test.name, err=e)) )
+          err.write(header("Subprocess Error: Test .stop() raised exception %s" % test.name))
+          traceback.print_exc(file=err)
           err.flush()
-      except (KeyboardInterrupt, SystemExit) as e:
-        test.stop(out)
-        err.write( """
-        -----------------------------------------------------
-          Cleaning up....
-        -----------------------------------------------------
-        {err}
-        """.format(err=e) )
-        err.flush()
+        out.close()
+        err.close()
+        return exit_with_code(1)
+      # TODO - subprocess should not catch this exception!
+      # Parent process should catch it and cleanup/exit
+      except (KeyboardInterrupt) as e:
+        self.__stop_test(out, err)
+        out.write(header("Cleaning up..."))
+        out.flush()
         self.__finish()
-        sys.exit()
+        sys.exit(1)
 
       out.close()
       err.close()
+      return exit_with_code(0)
 
   ############################################################
   # End __run_tests
+  ############################################################
+
+  ############################################################
+  # __stop_test(benchmarker)
+  # Stops all running tests
+  ############################################################
+  def __stop_test(self, out, err):
+    try:
+      subprocess.check_call('sudo killall -s 9 -u %s' % self.runner_user, shell=True, stderr=err, stdout=out)
+      retcode = 0
+    except Exception:
+      retcode = 1
+
+    return retcode
+  ############################################################
+  # End __stop_test
   ############################################################
 
   ############################################################
@@ -669,7 +682,7 @@ class Benchmarker:
       s.bind(("", port))
       # If we get here, we were able to bind successfully,
       # which means the port is free.
-    except:
+    except Exception:
       # If we get an exception, it might be because the port is still bound
       # which would be bad, or maybe it is a privileged port (<1024) and we
       # are not running as root, or maybe the server is gone, but sockets are
@@ -680,7 +693,7 @@ class Benchmarker:
         # If we get here, we were able to connect to something, which means
         # that the port is still bound.
         return True
-      except:
+      except Exception:
         # An exception means that we couldn't connect, so a server probably
         # isn't still running on the port.
         pass
@@ -709,7 +722,7 @@ class Benchmarker:
     # Time to create parsed files
     # Aggregate JSON file
     with open(os.path.join(self.full_results_directory(), "results.json"), "w") as f:
-      f.write(json.dumps(self.results))
+      f.write(json.dumps(self.results, indent=2))
 
   ############################################################
   # End __parse_results
@@ -718,25 +731,36 @@ class Benchmarker:
 
   #############################################################
   # __count_sloc
-  # This is assumed to be run from the benchmark root directory
   #############################################################
   def __count_sloc(self):
-    all_frameworks = self.__gather_frameworks()
+    frameworks = gather_frameworks(include=self.test,
+      exclude=self.exclude, benchmarker=self)
+    
     jsonResult = {}
+    for framework, testlist in frameworks.iteritems():
+      if not os.path.exists(os.path.join(testlist[0].directory, "source_code")):
+        logging.warn("Cannot count lines of code for %s - no 'source_code' file", framework)
+        continue
 
-    for framework in all_frameworks:
+      # Unfortunately the source_code files use lines like
+      # ./cpoll_cppsp/www/fortune_old instead of 
+      # ./www/fortune_old
+      # so we have to back our working dir up one level
+      wd = os.path.dirname(testlist[0].directory)
+      
       try:
-        command = "cloc --list-file=" + framework['directory'] + "/source_code --yaml"
-        lineCount = subprocess.check_output(command, shell=True)
+        command = "cloc --list-file=%s/source_code --yaml" % testlist[0].directory
         # Find the last instance of the word 'code' in the yaml output. This should
         # be the line count for the sum of all listed files or just the line count
         # for the last file in the case where there's only one file listed.
-        lineCount = lineCount[lineCount.rfind('code'):len(lineCount)]
-        lineCount = lineCount.strip('code: ')
-        lineCount = lineCount[0:lineCount.rfind('comment')]
-        jsonResult[framework['name']] = int(lineCount)
-      except:
+        command = command + "| grep code | tail -1 | cut -d: -f 2"
+        logging.debug("Running \"%s\" (cwd=%s)", command, wd)
+        lineCount = subprocess.check_output(command, cwd=wd, shell=True)
+        jsonResult[framework] = int(lineCount)
+      except subprocess.CalledProcessError:
         continue
+      except ValueError as ve:
+        logging.warn("Unable to get linecount for %s due to error '%s'", framework, ve)
     self.results['rawData']['slocCounts'] = jsonResult
   ############################################################
   # End __count_sloc
@@ -744,19 +768,44 @@ class Benchmarker:
 
   ############################################################
   # __count_commits
+  #
   ############################################################
   def __count_commits(self):
-    all_frameworks = self.__gather_frameworks()
+    frameworks = gather_frameworks(include=self.test,
+      exclude=self.exclude, benchmarker=self)
 
-    jsonResult = {}
-
-    for framework in all_frameworks:
+    def count_commit(directory, jsonResult):
+      command = "git rev-list HEAD -- " + directory + " | sort -u | wc -l"
       try:
-        command = "git rev-list HEAD -- " + framework + " | sort -u | wc -l"
         commitCount = subprocess.check_output(command, shell=True)
         jsonResult[framework] = int(commitCount)
-      except:
-        continue
+      except subprocess.CalledProcessError:
+        pass
+
+    # Because git can be slow when run in large batches, this 
+    # calls git up to 4 times in parallel. Normal improvement is ~3-4x
+    # in my trials, or ~100 seconds down to ~25
+    # This is safe to parallelize as long as each thread only 
+    # accesses one key in the dictionary
+    threads = []
+    jsonResult = {}
+    t1 = datetime.now()
+    for framework, testlist in frameworks.iteritems():
+      directory = testlist[0].directory
+      t = threading.Thread(target=count_commit, args=(directory,jsonResult))
+      t.start()
+      threads.append(t)
+      # Git has internal locks, full parallel will just cause contention
+      # and slowness, so we rate-limit a bit
+      if len(threads) >= 4:
+        threads[0].join()
+        threads.remove(threads[0])
+
+    # Wait for remaining threads
+    for t in threads:
+      t.join()
+    t2 = datetime.now()
+    # print "Took %s seconds " % (t2 - t1).seconds
 
     self.results['rawData']['commitCounts'] = jsonResult
     self.commits = jsonResult
@@ -771,7 +820,7 @@ class Benchmarker:
     try:
       self.results["completed"][test_name] = status_message
       with open(os.path.join(self.latest_results_directory, 'results.json'), 'w') as f:
-        f.write(json.dumps(self.results))
+        f.write(json.dumps(self.results, indent=2))
     except (IOError):
       logging.error("Error writing results.json")
 
@@ -779,10 +828,40 @@ class Benchmarker:
   # End __write_intermediate_results
   ############################################################
 
+  def __load_results(self):
+    try:
+      with open(os.path.join(self.latest_results_directory, 'results.json')) as f:
+        self.results = json.load(f)
+    except (ValueError, IOError):
+      pass
+
   ############################################################
   # __finish
   ############################################################
   def __finish(self):
+    if not self.list_tests and not self.list_test_metadata and not self.parse:
+      tests = self.__gather_tests
+      # Normally you don't have to use Fore.BLUE before each line, but 
+      # Travis-CI seems to reset color codes on newline (see travis-ci/travis-ci#2692)
+      # or stream flush, so we have to ensure that the color code is printed repeatedly
+      prefix = Fore.CYAN
+      for line in header("Verification Summary", top='=', bottom='').split('\n'):
+        print prefix + line
+      for test in tests:
+        print prefix + "| Test: %s" % test.name
+        if test.name in self.results['verify'].keys():
+          for test_type, result in self.results['verify'][test.name].iteritems():
+            if result.upper() == "PASS":
+              color = Fore.GREEN
+            elif result.upper() == "WARN":
+              color = Fore.YELLOW
+            else:
+              color = Fore.RED
+            print prefix + "|       " + test_type.ljust(11) + ' : ' + color + result.upper()
+        else:
+          print prefix + "|      " + Fore.RED + "NO RESULTS (Did framework launch?)"
+      print prefix + header('', top='', bottom='=') + Style.RESET_ALL
+
     print "Time to complete: " + str(int(time.time() - self.start_time)) + " seconds"
     print "Results are saved in " + os.path.join(self.result_directory, self.timestamp)
 
@@ -800,45 +879,51 @@ class Benchmarker:
   ############################################################
   def __init__(self, args):
     
+    # Map type strings to their objects
+    types = dict()
+    types['json'] = JsonTestType()
+    types['db'] = DBTestType()
+    types['query'] = QueryTestType()
+    types['fortune'] = FortuneTestType()
+    types['update'] = UpdateTestType()
+    types['plaintext'] = PlaintextTestType()
+
+    # Turn type into a map instead of a string
+    if args['type'] == 'all':
+        args['types'] = types
+    else:
+        args['types'] = { args['type'] : types[args['type']] }
+    del args['type']
+    
+
+    args['max_threads'] = args['threads']
+    args['max_concurrency'] = max(args['concurrency_levels'])
+
     self.__dict__.update(args)
+    # pprint(self.__dict__)
+
     self.start_time = time.time()
     self.run_test_timeout_seconds = 3600
 
     # setup logging
-    logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO)
     
     # setup some additional variables
     if self.database_user == None: self.database_user = self.client_user
     if self.database_host == None: self.database_host = self.client_host
     if self.database_identity_file == None: self.database_identity_file = self.client_identity_file
 
+    # Remember root directory
+    self.fwroot = setup_util.get_fwroot()
+
     # setup results and latest_results directories 
     self.result_directory = os.path.join("results", self.name)
     self.latest_results_directory = self.latest_results_directory()
   
-    if self.parse != None:
+    if hasattr(self, 'parse') and self.parse != None:
       self.timestamp = self.parse
     else:
       self.timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
-
-    # Setup the concurrency levels array. This array goes from
-    # starting_concurrency to max concurrency, doubling each time
-    self.concurrency_levels = []
-    concurrency = self.starting_concurrency
-    while concurrency <= self.max_concurrency:
-      self.concurrency_levels.append(concurrency)
-      concurrency = concurrency * 2
-
-    # Setup query interval array
-    # starts at 1, and goes up to max_queries, using the query_interval
-    self.query_intervals = []
-    queries = 1
-    while queries <= self.max_queries:
-      self.query_intervals.append(queries)
-      if queries == 1:
-        queries = 0
-
-      queries = queries + self.query_interval
     
     # Load the latest data
     #self.latest = None
@@ -872,7 +957,7 @@ class Benchmarker:
       self.results = dict()
       self.results['name'] = self.name
       self.results['concurrencyLevels'] = self.concurrency_levels
-      self.results['queryIntervals'] = self.query_intervals
+      self.results['queryIntervals'] = self.query_levels
       self.results['frameworks'] = [t.name for t in self.__gather_tests]
       self.results['duration'] = self.duration
       self.results['rawData'] = dict()
@@ -883,6 +968,21 @@ class Benchmarker:
       self.results['rawData']['update'] = dict()
       self.results['rawData']['plaintext'] = dict()
       self.results['completed'] = dict()
+      self.results['succeeded'] = dict()
+      self.results['succeeded']['json'] = []
+      self.results['succeeded']['db'] = []
+      self.results['succeeded']['query'] = []
+      self.results['succeeded']['fortune'] = []
+      self.results['succeeded']['update'] = []
+      self.results['succeeded']['plaintext'] = []
+      self.results['failed'] = dict()
+      self.results['failed']['json'] = []
+      self.results['failed']['db'] = []
+      self.results['failed']['query'] = []
+      self.results['failed']['fortune'] = []
+      self.results['failed']['update'] = []
+      self.results['failed']['plaintext'] = []
+      self.results['verify'] = dict()
     else:
       #for x in self.__gather_tests():
       #  if x.name not in self.results['frameworks']:
@@ -898,8 +998,8 @@ class Benchmarker:
     if self.client_identity_file != None:
       self.client_ssh_string = self.client_ssh_string + " -i " + self.client_identity_file
 
-    if self.install_software:
-      install = Installer(self)
+    if self.install is not None:
+      install = Installer(self, self.install_strategy)
       install.install_software()
 
   ############################################################

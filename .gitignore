@@ -67,4 +67,8 @@ benchmark.cfg
 *.war
 
 # go
-go/pkg/
+go/pkg/*
+beego/pkg/*
+
+# urweb
+frameworks/Ur/urweb/*.exe
