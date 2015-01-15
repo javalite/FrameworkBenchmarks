@@ -15,7 +15,7 @@
       "database": "MySQL",
       "framework": "activeweb",
       "language": "Java",
-      "orm": "Micro",
+      "orm": "ActiveJDBC",
       "platform": "Servlet",
       "webserver": "Resin",
       "os": "Linux",
